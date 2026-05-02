@@ -1,0 +1,47 @@
+name: Mirror GStreamer Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'GStreamer version (np. 1.28.2)'
+        required: true
+        default: '1.28.2'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          mkdir -p artifacts
+
+          declare -A FILES=(
+            ["windows"]="https://gstreamer.freedesktop.org/data/pkg/windows/${VERSION}/msvc/gstreamer-1.0-msvc-x86_64-${VERSION}.exe"
+            ["osx"]="https://gstreamer.freedesktop.org/data/pkg/osx/${VERSION}/gstreamer-1.0-${VERSION}-universal.pkg"
+            ["osx-devel"]="https://gstreamer.freedesktop.org/data/pkg/osx/${VERSION}/gstreamer-1.0-devel-${VERSION}-universal.pkg"
+          )
+
+          for KEY in "${!FILES[@]}"; do
+            URL="${FILES[$KEY]}"
+            FILENAME=$(basename "$URL")
+            echo "Downloading $FILENAME..."
+            curl -L --retry 3 --retry-delay 10 --fail \
+              "$URL" -o "artifacts/$FILENAME"
+            echo "  OK: $(du -sh artifacts/$FILENAME | cut -f1)"
+          done
+
+      - name: Create GitHub Release
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          gh release create "$VERSION" \
+            --repo ${{ github.repository }} \
+            --title "GStreamer $VERSION" \
+            --notes "Mirror of GStreamer ${VERSION} from gstreamer.freedesktop.org" \
+            artifacts/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
