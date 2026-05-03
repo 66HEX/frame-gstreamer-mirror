@@ -1,0 +1,199 @@
+name: Build Linux GStreamer Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      gstreamer_version:
+        description: GStreamer/Cerbero version tag to build
+        required: true
+        default: "1.28.2"
+      release_tag:
+        description: GitHub release tag to upload artifacts to
+        required: true
+        default: "1.28.2"
+
+permissions:
+  contents: write
+
+env:
+  CERBERO_REPO: https://gitlab.freedesktop.org/gstreamer/cerbero.git
+
+jobs:
+  build-linux-gstreamer:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            python3-pip \
+            python3-setuptools \
+            python3-wheel \
+            build-essential \
+            pkg-config \
+            xz-utils \
+            tar \
+            rsync \
+            file \
+            patchelf
+
+      - name: Clone Cerbero
+        run: |
+          git clone --depth 1 --branch "${{ inputs.gstreamer_version }}" "$CERBERO_REPO" "$RUNNER_TEMP/cerbero"
+
+      - name: Bootstrap Cerbero
+        working-directory: ${{ runner.temp }}/cerbero
+        run: |
+          ./cerbero-uninstalled bootstrap
+
+      - name: Build GStreamer package
+        working-directory: ${{ runner.temp }}/cerbero
+        run: |
+          ./cerbero-uninstalled package gstreamer-1.0
+
+      - name: Locate Cerbero prefix
+        id: prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          candidates=()
+          while IFS= read -r dir; do
+            candidates+=("$dir")
+          done < <(
+            find "$RUNNER_TEMP/cerbero/build/dist" "$HOME/cerbero/dist" \
+              -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort
+          )
+
+          if [ "${#candidates[@]}" -eq 0 ]; then
+            echo "Could not find Cerbero dist prefix"
+            find "$RUNNER_TEMP/cerbero" -maxdepth 4 -type d -name dist -print || true
+            exit 1
+          fi
+
+          prefix="${candidates[-1]}"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "Using prefix: $prefix"
+
+      - name: Create Frame runtime tarball
+        id: package
+        shell: bash
+        env:
+          PREFIX: ${{ steps.prefix.outputs.prefix }}
+          VERSION: ${{ inputs.gstreamer_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          runtime_root="$RUNNER_TEMP/frame-gstreamer-runtime"
+          artifact_dir="$RUNNER_TEMP/frame-gstreamer-artifacts"
+          artifact_name="frame-gstreamer-linux-${ARCH}-${VERSION}.tar.xz"
+          artifact_path="$artifact_dir/$artifact_name"
+
+          rm -rf "$runtime_root" "$artifact_dir"
+          mkdir -p "$runtime_root/runtime" "$artifact_dir"
+
+          for entry in bin include lib libexec share; do
+            if [ -e "$PREFIX/$entry" ]; then
+              rsync -a "$PREFIX/$entry" "$runtime_root/runtime/"
+            fi
+          done
+
+          test -f "$runtime_root/runtime/lib/pkgconfig/gstreamer-1.0.pc"
+          test -f "$runtime_root/runtime/lib/pkgconfig/gstreamer-app-1.0.pc"
+          test -f "$runtime_root/runtime/lib/pkgconfig/gstreamer-video-1.0.pc"
+          test -f "$runtime_root/runtime/lib/pkgconfig/gstreamer-pbutils-1.0.pc"
+          test -d "$runtime_root/runtime/lib/gstreamer-1.0"
+          test -x "$runtime_root/runtime/libexec/gstreamer-1.0/gst-plugin-scanner"
+
+          find "$runtime_root/runtime" -name "*.a" -delete
+          find "$runtime_root/runtime" -name "*.la" -delete
+
+          {
+            echo "version=$VERSION"
+            echo "platform=linux"
+            echo "arch=$ARCH"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source=cerbero:${VERSION}"
+          } > "$runtime_root/runtime/FRAME_GSTREAMER_BUILD.txt"
+
+          tar -C "$runtime_root" -cJf "$artifact_path" runtime
+
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "artifact_path=$artifact_path" >> "$GITHUB_OUTPUT"
+          ls -lh "$artifact_path"
+
+      - name: Validate runtime smoke requirements
+        shell: bash
+        env:
+          ARTIFACT_PATH: ${{ steps.package.outputs.artifact_path }}
+        run: |
+          set -euo pipefail
+
+          smoke_root="$RUNNER_TEMP/frame-gstreamer-smoke"
+          rm -rf "$smoke_root"
+          mkdir -p "$smoke_root"
+
+          tar -C "$smoke_root" -xJf "$ARTIFACT_PATH"
+
+          export LD_LIBRARY_PATH="$smoke_root/runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export PATH="$smoke_root/runtime/bin:$PATH"
+          export GST_PLUGIN_PATH_1_0="$smoke_root/runtime/lib/gstreamer-1.0"
+          export GST_PLUGIN_SCANNER_1_0="$smoke_root/runtime/libexec/gstreamer-1.0/gst-plugin-scanner"
+          export GST_REGISTRY="$RUNNER_TEMP/frame-gstreamer-registry-${{ matrix.arch }}.bin"
+
+          gst-inspect-1.0 --version
+
+          required_factories=(
+            filesrc
+            queue
+            decodebin
+            videoconvert
+            videoscale
+            videorate
+            appsink
+          )
+
+          for factory in "${required_factories[@]}"; do
+            gst-inspect-1.0 "$factory" >/dev/null
+          done
+
+          # We want libav in the private runtime for broad file preview support.
+          gst-inspect-1.0 libav >/dev/null
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release exists: $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes "Frame GStreamer mirror artifacts for $RELEASE_TAG"
+          fi
+
+      - name: Upload release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARTIFACT_PATH: ${{ steps.package.outputs.artifact_path }}
+        run: |
+          gh release upload "$RELEASE_TAG" "$ARTIFACT_PATH" --clobber
